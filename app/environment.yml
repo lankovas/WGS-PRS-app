@@ -1,0 +1,14 @@
+name: prs-app-env
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.10
+  - streamlit
+  - snakemake
+  - pyyaml
+  - pandas
+  - numpy
+  - plotly
+  - scipy 
+  - requests 

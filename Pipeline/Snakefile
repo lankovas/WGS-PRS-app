@@ -1,0 +1,633 @@
+import os
+import re
+import yaml
+import hashlib
+import shutil
+import subprocess
+import sys
+
+# ==============================================================================
+# 1. PIPELINE CONFIGURATION & INPUT PARSING
+# ==============================================================================
+# Extract inputs, sequencing types, and thresholds from the run config
+INPUT_FILE = config.get("input_file", "")
+INPUT_TYPE = str(config.get("input_type", "vcf")).strip().lower()
+INPUT_IS_GVCF = (
+    INPUT_TYPE == "gvcf"
+    or str(config.get("input_is_gvcf", "")).strip().lower() in {"true", "1", "yes"}
+    or bool(re.search(r"\.g\.vcf(?:\.gz)?$", str(INPUT_FILE), re.IGNORECASE))
+)
+
+if INPUT_TYPE not in {"vcf", "gvcf", "bam"}:
+    raise ValueError(f"Unsupported input_type={INPUT_TYPE!r}; expected vcf, gvcf, or bam")
+
+SEQ_TYPE = config.get("seq_type", "WGS")
+GENOME_BUILD = config.get("genome_build", "GRCh38")
+PGS_PANEL_ID = config.get("pgs_panel", "Unknown_Panel")
+AF_MODE = config.get("af_mode", "1000G")
+
+# Parse manual ancestry overrides if provided
+_ka = config.get("known_ancestry", "RUN_SOMALIER")
+if not _ka or str(_ka).strip().upper() in ["", "NONE", "NA"]:
+    KNOWN_ANCESTRY = "RUN_SOMALIER"
+else:
+    KNOWN_ANCESTRY = str(_ka).strip()
+
+ASSUME_FORWARD = config.get("assume_forward", "False")
+EFFECT_IS_ALT = config.get("effect_is_alt", "False")
+SKIP_BEAGLE = config.get("skip_beagle", "False")
+
+# Define sample naming and identity keys
+FINAL_SAMPLE_NAME = config.get("final_sample_name", "") 
+BASE_SAMPLE_NAME = config.get("base_sample_name", "TEST_SAMPLE")
+WGS_CACHE_KEY = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(config.get("wgs_cache_key", BASE_SAMPLE_NAME))).strip("._-") or "UNKNOWN_SAMPLE"
+
+# Quality Control thresholds
+MIN_DP = config.get("min_dp", 15)
+MIN_GQ = config.get("min_gq", 50)
+MIN_AF = config.get("min_af", 0.20)
+BEAGLE_DR2 = config.get("beagle_dr2", 0.90)
+PAL_LOW = config.get("pal_low", 0.40)
+PAL_HIGH = config.get("pal_high", 0.60)
+VARIANT_ACTIONS = config.get("variant_actions", "")
+
+# ==============================================================================
+# 2. REFERENCE FILES & GENOME BUILD SETUP
+# ==============================================================================
+# Use absolute paths inside the Docker container
+CONFIG_PATH = config.get("reference_config", "/prs-app/Pipeline/reference_config.yaml")
+
+with open(CONFIG_PATH, "r") as stream: 
+    base_config = yaml.load(stream, Loader=yaml.FullLoader)
+
+TMP_PATH = config.get("tmp_dir", "/prs-app/tmp")
+PATH_BASE = "/prs-app/Pipeline"
+
+# Assign reference paths based on the selected genome build
+if GENOME_BUILD == "GRCh37":
+    BUILD_LOWER = "hg19"
+    REF_FASTA = base_config.get("ref_fasta_hg19")
+    KG_PRIMARY = base_config.get("kg_ref_hg19_prefix")
+    KG_FALLBACK = base_config.get("kg_ref_hg38_prefix")
+    GNOMAD_LCR_BED = base_config.get("gnomad_lcr_bed_hg19")
+    SOMALIER_SITES = base_config.get("somalier_sites_hg19")
+    BEAGLE_REF_DIR = base_config.get("beagle_ref_dir_hg19")
+else:
+    BUILD_LOWER = "hg38"
+    REF_FASTA = base_config.get("ref_fasta_hg38")
+    KG_PRIMARY = base_config.get("kg_ref_hg38_prefix")
+    KG_FALLBACK = base_config.get("kg_ref_hg19_prefix")
+    GNOMAD_LCR_BED = base_config.get("gnomad_lcr_bed_hg38")
+    SOMALIER_SITES = base_config.get("somalier_sites_hg38")
+    BEAGLE_REF_DIR = base_config.get("beagle_ref_dir_hg38")
+
+SOMALIER_LABELS = base_config.get("somalier_labels")
+
+LCR_INPUT = [GNOMAD_LCR_BED] if GNOMAD_LCR_BED else []
+LCR_PARAM = GNOMAD_LCR_BED if GNOMAD_LCR_BED else "NONE"
+SOMALIER_SITES_INPUT = [SOMALIER_SITES] if SOMALIER_SITES else []
+SOMALIER_SITES_PARAM = SOMALIER_SITES if SOMALIER_SITES else "NONE"
+
+# ==============================================================================
+# 3. CACHING & SIGNATURE FINGERPRINTING
+# ==============================================================================
+# These functions create unique hashes of reference files and configs.
+# This prevents unnecessary recalculations unless inputs or settings actually change.
+BASE_CACHE_DIR = f"{PATH_BASE}/inputs/reference_cache/{PGS_PANEL_ID}/{PGS_PANEL_ID}_{BUILD_LOWER}_base"
+
+cache_suffix = ""
+if str(ASSUME_FORWARD).lower() == "true": 
+    cache_suffix += "_fwd"
+if str(EFFECT_IS_ALT).lower() == "true": 
+    cache_suffix += "_alt"
+if str(AF_MODE).upper() == "PGS_FILE": 
+    cache_suffix += "_pgsaf"
+
+def _calibration_stat_fingerprint(path):
+    try:
+        st = os.stat(path)
+        return f"{os.path.abspath(path)}:{st.st_size}:{int(st.st_mtime)}"
+    except (OSError, TypeError):
+        return f"{path}:MISSING"
+
+def _file_sha256_or_empty(path):
+    if not path or str(path).upper() in {"NONE", "NA"} or not os.path.isfile(path):
+        return hashlib.sha256(b"").hexdigest()
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+ACTIONS_SHA256 = _file_sha256_or_empty(VARIANT_ACTIONS)
+if os.path.isfile(VARIANT_ACTIONS) and os.path.getsize(VARIANT_ACTIONS) > 0:
+    cache_suffix += f"_act_{ACTIONS_SHA256[:12]}"
+
+def _reference_resource_fingerprint(prefix):
+    parts = []
+    for suffix in (".pgen", ".pvar", ".psam", ".bed", ".bim", ".fam"):
+        path = str(prefix) + suffix
+        parts.append(_calibration_stat_fingerprint(path))
+    return "|".join(parts)
+
+PRS_FILE = config.get("pgs_file", "")
+
+# Generate final signatures for the calibration cache
+CALIBRATION_RESOURCE_SIGNATURE = "calibration-resources-v2|" + "|".join([
+    _calibration_stat_fingerprint(PRS_FILE),
+    _reference_resource_fingerprint(KG_PRIMARY),
+    _reference_resource_fingerprint(KG_FALLBACK),
+])
+CALIBRATION_RESOURCE_SHA256 = hashlib.sha256(
+    CALIBRATION_RESOURCE_SIGNATURE.encode("utf-8")
+).hexdigest()[:12]
+CALIBRATION_SIGNATURE = (
+    f"actions_sha256={ACTIONS_SHA256}|{CALIBRATION_RESOURCE_SIGNATURE}|"
+    f"build={BUILD_LOWER}|af_mode={AF_MODE}|assume_forward={ASSUME_FORWARD}|"
+    f"effect_is_alt={EFFECT_IS_ALT}"
+)
+
+PANEL_CACHE_DIR = f"{PATH_BASE}/inputs/reference_cache/{PGS_PANEL_ID}/{PGS_PANEL_ID}_{BUILD_LOWER}{cache_suffix}_ref_{CALIBRATION_RESOURCE_SHA256}"
+
+AF_CACHE_FILE = config.get("af_cache", "")
+if AF_CACHE_FILE and AF_CACHE_FILE.upper() != "NONE":
+    base_name, ext = os.path.splitext(AF_CACHE_FILE)
+    AF_CACHE_FILE = f"{base_name}{cache_suffix}_ref_{CALIBRATION_RESOURCE_SHA256}{ext}"
+
+_raw_sample_name = FINAL_SAMPLE_NAME if FINAL_SAMPLE_NAME else f"TEST_SAMPLE_{PGS_PANEL_ID}"
+SAMPLE = f"{_raw_sample_name}{cache_suffix}"
+BASE_SAMPLE = BASE_SAMPLE_NAME
+
+# Setup WGS Somalier Cache to avoid redundant ancestry calls for whole genomes
+SOMALIER_REF_DIR = base_config.get("somalier_ref_dir")
+SOMALIER_WGS_CACHE = f"{TMP_PATH}/somalier_wgs_cache/{WGS_CACHE_KEY}_{BUILD_LOWER}.somalier-ancestry.tsv"
+SOMALIER_WGS_MANIFEST = f"{SOMALIER_WGS_CACHE}.manifest"
+
+def _stat_fingerprint(path):
+    try:
+        st = os.stat(path)
+        return f"{os.path.abspath(path)}:{st.st_size}:{int(st.st_mtime)}"
+    except (OSError, TypeError):
+        return f"{path}:MISSING"
+
+_somalier_resource_fingerprints = [_stat_fingerprint(INPUT_FILE), _stat_fingerprint(REF_FASTA)]
+if SOMALIER_SITES:
+    _somalier_resource_fingerprints.append(_stat_fingerprint(SOMALIER_SITES))
+_somalier_resource_fingerprints.append(_stat_fingerprint(SOMALIER_LABELS))
+try:
+    _somalier_ref_files = sorted(os.path.join(SOMALIER_REF_DIR, n) for n in os.listdir(SOMALIER_REF_DIR) if n.endswith(".somalier"))
+except OSError:
+    _somalier_ref_files = []
+_somalier_resource_fingerprints.extend(_stat_fingerprint(p) for p in _somalier_ref_files)
+SOMALIER_CACHE_SIGNATURE = "somalier-cache-v2|build=" + BUILD_LOWER + "|key=" + WGS_CACHE_KEY + "|" + "|".join(_somalier_resource_fingerprints)
+
+_cache_manifest_matches = False
+if os.path.isfile(SOMALIER_WGS_MANIFEST):
+    try:
+        with open(SOMALIER_WGS_MANIFEST, "r") as _manifest_handle:
+            _cache_manifest_matches = _manifest_handle.read().strip() == SOMALIER_CACHE_SIGNATURE
+    except OSError:
+        _cache_manifest_matches = False
+
+if SEQ_TYPE == "Whole Genome Sequencing (WGS)" and os.path.isfile(SOMALIER_WGS_CACHE) and os.path.getsize(SOMALIER_WGS_CACHE) > 0 and _cache_manifest_matches:
+    SOMALIER_TARGET_FILE = SOMALIER_WGS_CACHE
+else:
+    SOMALIER_TARGET_FILE = f"{TMP_PATH}/ancestry_raw_full/{SAMPLE}.somalier-ancestry.tsv"
+
+# ==============================================================================
+# 4. PIPELINE RULES
+# ==============================================================================
+
+# Final target outputs expected by the pipeline
+rule all:
+    input:
+        f"{TMP_PATH}/prs_imputed_full/{SAMPLE}_prs_results.csv",
+        f"{TMP_PATH}/beagle_full/{SAMPLE}_imputed.vcf.gz"
+
+# Precompute reference stats and cache them to speed up future runs on the same panel
+rule Calibrate_Reference_Distributions:
+    input: prs_file=PRS_FILE
+    output: flag_done=f"{PANEL_CACHE_DIR}/calibration.done"
+    params:
+        kg_primary=KG_PRIMARY, kg_fallback=KG_FALLBACK,
+        cache_dir=PANEL_CACHE_DIR, base_cache_dir=BASE_CACHE_DIR,
+        build=BUILD_LOWER, actions_sha256=ACTIONS_SHA256,
+        resource_signature=CALIBRATION_SIGNATURE,
+        af_out=AF_CACHE_FILE,
+        assume_forward=ASSUME_FORWARD, effect_is_alt=EFFECT_IS_ALT,
+        variant_actions=VARIANT_ACTIONS,
+        pal_low=PAL_LOW, pal_high=PAL_HIGH, af_mode=AF_MODE,
+        python_exe=sys.executable,
+        script=os.path.join(PATH_BASE, "scripts", "build_reference_cache.py")
+    conda: "envs/plink2.yaml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.cache_dir}"
+        staged_actions="{params.cache_dir}/variant_actions.tsv"
+
+        if [ -n "{params.variant_actions}" ] && [ -f "{params.variant_actions}" ]; then
+            cp "{params.variant_actions}" "$staged_actions"
+        else
+            : > "$staged_actions"
+        fi
+
+        "{params.python_exe}" "{params.script}" \
+            --build "{params.build}" \
+            --kg_primary "{params.kg_primary}" \
+            --kg_fallback "{params.kg_fallback}" \
+            --prs_file "{input.prs_file}" \
+            --out_dir "{params.cache_dir}" \
+            --base_cache_dir "{params.base_cache_dir}" \
+            --variant_actions "$staged_actions" \
+            --af_cache_out "{params.af_out}" \
+            --assume_forward "{params.assume_forward}" \
+            --effect_is_alt "{params.effect_is_alt}" \
+            --pal_low "{params.pal_low}" \
+            --pal_high "{params.pal_high}" \
+            --af_mode "{params.af_mode}"
+
+        printf '%s\n' "{params.resource_signature}" > "{output.flag_done}"
+        """
+# Run variant calling if the input is a BAM file
+rule CallVariantsGATK_from_BAM:
+    input:
+        bam=INPUT_FILE, ref=REF_FASTA,
+        bed=f"{BASE_CACHE_DIR}/panel_coords_primary.bed"
+    output: vcf=f"{TMP_PATH}/variant_calling_full/{{sample}}.vcf"
+    params:
+        is_targeted="true" if "Targeted" in SEQ_TYPE else "false"
+    conda: "envs/gatk.yaml"
+    shell:
+        r"""
+        if [ "{params.is_targeted}" = "true" ]; then
+            gatk HaplotypeCaller -R "{input.ref}" -I "{input.bam}" -L "{input.bed}" -O "{output.vcf}"
+        else
+            gatk HaplotypeCaller -R "{input.ref}" -I "{input.bam}" -O "{output.vcf}"
+        fi
+        """
+
+# Compress and index the newly called VCF
+rule compress_index_vcf:
+    input: vcf=f"{TMP_PATH}/variant_calling_full/{{sample}}.vcf"
+    output: vcf=f"{TMP_PATH}/variant_calling_full/{{sample}}.vcf.gz", tbi=f"{TMP_PATH}/variant_calling_full/{{sample}}.vcf.gz.tbi"
+    conda: "envs/bcftools.yaml" 
+    shell: "bgzip -c {input.vcf} > {output.vcf} && tabix -p vcf {output.vcf}"
+
+def get_vcf_for_leftalign(wildcards):
+    return INPUT_FILE if INPUT_TYPE in {"vcf", "gvcf"} else f"{TMP_PATH}/variant_calling_full/{wildcards.sample}.vcf.gz"
+
+# Normalize and left-align indels to ensure consistent variant representation
+rule LEFTALIGN:
+    input: vcf=get_vcf_for_leftalign, ref=REF_FASTA
+    output:
+        vcf=f"{TMP_PATH}/leftalign_raw_full/{{sample}}_{BUILD_LOWER}_clean.vcf.gz",
+        tbi=f"{TMP_PATH}/leftalign_raw_full/{{sample}}_{BUILD_LOWER}_clean.vcf.gz.tbi"
+    params:
+        is_wgs="true" if SEQ_TYPE == "Whole Genome Sequencing (WGS)" else "false",
+        wgs_cache_vcf=f"{TMP_PATH}/leftalign_wgs_cache/{WGS_CACHE_KEY}_{BUILD_LOWER}_clean.vcf.gz",
+        wgs_cache_tbi=f"{TMP_PATH}/leftalign_wgs_cache/{WGS_CACHE_KEY}_{BUILD_LOWER}_clean.vcf.gz.tbi",
+        wgs_cache_manifest=f"{TMP_PATH}/leftalign_wgs_cache/{WGS_CACHE_KEY}_{BUILD_LOWER}_clean.manifest"
+    conda: "envs/leftalign.yaml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname '{output.vcf}')"
+
+        # Try a hard link first (faster), then fall back to a copy if filesystem restricts it
+        link_or_copy() {{
+            ln -f "$1" "$2" 2>/dev/null || cp -f "$1" "$2"
+        }}
+
+        input_sig=$(sha256sum "{input.vcf}" | awk '{{print $1}}')
+        ref_sig=$(stat -c '%s:%y:%n' "{input.ref}")
+        cache_sig="leftalign-v3|input=${{input_sig}}|ref=${{ref_sig}}|build={BUILD_LOWER}|key={WGS_CACHE_KEY}"
+
+        # Reuse cache if available and matching signature
+        if [ "{params.is_wgs}" = "true" ] \
+           && [ -s "{params.wgs_cache_vcf}" ] \
+           && [ -s "{params.wgs_cache_tbi}" ] \
+           && [ -s "{params.wgs_cache_manifest}" ] \
+           && [ "$(cat '{params.wgs_cache_manifest}')" = "$cache_sig" ]; then
+            echo "Reusing validated left-alignment cache for {wildcards.sample}"
+            link_or_copy "{params.wgs_cache_vcf}" "{output.vcf}"
+            link_or_copy "{params.wgs_cache_tbi}" "{output.tbi}"
+        else
+            rm -f "{output.vcf}" "{output.tbi}"
+            TEMP_DIR="{TMP_PATH}/leftalign_tmp_{wildcards.sample}"
+            rm -rf "$TEMP_DIR"
+            mkdir -p "$TEMP_DIR"
+
+            # Fix header issues prior to normalization
+            bcftools view -h "{input.vcf}" > "$TEMP_DIR/header.txt"
+            sed -i 's/ID=QR,Number=1,Type=Integer/ID=QR,Number=1,Type=Float/g' "$TEMP_DIR/header.txt"
+            sed -i 's/ID=QA,Number=A,Type=Integer/ID=QA,Number=A,Type=Float/g' "$TEMP_DIR/header.txt"
+
+            bcftools reheader -h "$TEMP_DIR/header.txt" "{input.vcf}" > "$TEMP_DIR/fixed.vcf.gz"
+            bcftools norm -a -c w -f "{input.ref}" -m -any "$TEMP_DIR/fixed.vcf.gz" -O z -o "$TEMP_DIR/norm.vcf.gz"
+
+            echo "{BASE_SAMPLE}" > "$TEMP_DIR/new_sm.txt"
+            bcftools reheader -s "$TEMP_DIR/new_sm.txt" "$TEMP_DIR/norm.vcf.gz" > "{output.vcf}"
+            tabix -p vcf "{output.vcf}"
+            rm -rf "$TEMP_DIR"
+
+            # Populate cache if this is a WGS run
+            if [ "{params.is_wgs}" = "true" ]; then
+                mkdir -p "$(dirname '{params.wgs_cache_vcf}')"
+                link_or_copy "{output.vcf}" "{params.wgs_cache_vcf}"
+                link_or_copy "{output.tbi}" "{params.wgs_cache_tbi}"
+                printf '%s\n' "$cache_sig" > "{params.wgs_cache_manifest}.tmp"
+                mv -f "{params.wgs_cache_manifest}.tmp" "{params.wgs_cache_manifest}"
+            fi
+        fi
+        """
+
+# Extract sites from the VCF required for ancestry inference
+rule Somalier_Extract:
+    input: vcf=f"{TMP_PATH}/leftalign_raw_full/{{sample}}_{BUILD_LOWER}_clean.vcf.gz", ref=REF_FASTA, sites=SOMALIER_SITES_INPUT
+    output: extract=f"{TMP_PATH}/ancestry_raw_full/{{sample}}.somalier"
+    params: sites_param=SOMALIER_SITES_PARAM
+    conda: "envs/somalier.yaml"
+    shell: 
+        """
+        TEMP_DIR="{TMP_PATH}/ancestry_raw_full/tmp_{wildcards.sample}"
+        rm -rf "$TEMP_DIR"; mkdir -p "$TEMP_DIR"
+        
+        if [ "{params.sites_param}" != "NONE" ]; then
+            somalier extract -d "$TEMP_DIR" --sites {params.sites_param} -f {input.ref} {input.vcf}
+        else
+            touch "$TEMP_DIR/dummy.somalier"
+        fi
+        
+        EXTRACTED_FILE=$(ls "$TEMP_DIR"/*.somalier | head -n 1)
+        mv "$EXTRACTED_FILE" "{output}"
+        rm -rf "$TEMP_DIR"
+        """
+
+# Predict ancestry using extracted variants
+rule Somalier_Ancestry:
+    input: extract=f"{TMP_PATH}/ancestry_raw_full/{{sample}}.somalier"
+    output: 
+        ancestry_tsv=f"{TMP_PATH}/ancestry_raw_full/{{sample}}.somalier-ancestry.tsv",
+        ancestry_html=f"{TMP_PATH}/ancestry_raw_full/{{sample}}.somalier-ancestry.html"
+    params:
+        labels=SOMALIER_LABELS,
+        ref_dir=SOMALIER_REF_DIR,
+        is_wgs="true" if SEQ_TYPE == "Whole Genome Sequencing (WGS)" else "false",
+        wgs_cache=SOMALIER_WGS_CACHE,
+        wgs_manifest=SOMALIER_WGS_MANIFEST,
+        cache_signature=SOMALIER_CACHE_SIGNATURE
+    conda: "envs/somalier.yaml"
+    shell:
+        r"""
+        set -euo pipefail
+        OUT_PREFIX="{TMP_PATH}/ancestry_raw_full/{wildcards.sample}_somalier_result"
+        GENERATED="${{OUT_PREFIX}}.somalier-ancestry.tsv"
+        rm -f "$GENERATED" "{output.ancestry_tsv}" "{output.ancestry_tsv}.tmp"
+
+        if [ -s "{input.extract}" ] && somalier ancestry --labels {params.labels} {params.ref_dir}/*.somalier ++ {input.extract} -o "$OUT_PREFIX"; then
+            if [ -s "$GENERATED" ]; then
+                awk -F'\t' 'BEGIN{{OFS="\t"}} {{ if($3 == "") $1="{BASE_SAMPLE}"; print $0 }}' "$GENERATED" > "{output.ancestry_tsv}.tmp"
+                mv -f "{output.ancestry_tsv}.tmp" "{output.ancestry_tsv}"
+                
+                if [ -f "${{OUT_PREFIX}}.somalier-ancestry.html" ]; then
+                    mv -f "${{OUT_PREFIX}}.somalier-ancestry.html" "{output.ancestry_html}"
+                else
+                    : > "{output.ancestry_html}"
+                fi
+                
+                # Cache results for WGS to speed up future runs on the same sample
+                if [ "{params.is_wgs}" = "true" ]; then
+                    mkdir -p "$(dirname '{params.wgs_cache}')"
+                    cp -f "{output.ancestry_tsv}" "{params.wgs_cache}.tmp"
+                    mv -f "{params.wgs_cache}.tmp" "{params.wgs_cache}"
+                    printf '%s\n' "{params.cache_signature}" > "{params.wgs_manifest}.tmp"
+                    mv -f "{params.wgs_manifest}.tmp" "{params.wgs_manifest}"
+                fi
+            else
+                echo "Somalier returned success but produced no ancestry table."
+                : > "{output.ancestry_tsv}"
+                : > "{output.ancestry_html}"
+            fi
+        else
+            echo "Somalier ancestry failed or no valid extract was present; writing an empty result for EUR fallback."
+            rm -f "$GENERATED" "{output.ancestry_tsv}.tmp"
+            : > "{output.ancestry_tsv}"
+            : > "{output.ancestry_html}"
+        fi
+        """
+
+# Build a final ancestry file, taking manual overrides into account
+rule Build_Ancestry_File:
+    input: somalier_file=[SOMALIER_TARGET_FILE] if SOMALIER_TARGET_FILE != "NONE" else []
+    output: master_tsv=f"{TMP_PATH}/ancestry_raw_full/{{sample}}_ancestry.tsv"
+    run:
+        manual_anc = None
+        if KNOWN_ANCESTRY != "RUN_SOMALIER":
+            manual_anc = KNOWN_ANCESTRY.split("(")[1].split(")")[0] if "(" in KNOWN_ANCESTRY else "EUR"
+
+        if input.somalier_file and os.path.exists(input.somalier_file[0]) and os.path.getsize(input.somalier_file[0]) > 0:
+            somalier_file = input.somalier_file[0]
+            if manual_anc:
+                shell("""
+                    tr -d '\r' < {somalier_file} | awk -v anc="{manual_anc}" -F'\t' 'BEGIN{{OFS="\t"}} NR==1 {{print $0, "ancestry_notes"}} NR>1 {{$2=anc; print $0, "MANUALLY_PROVIDED_WITH_PCS"}}' > {output.master_tsv}
+                """, somalier_file=somalier_file, manual_anc=manual_anc)
+            else:
+                shell("""
+                    tr -d '\r' < {somalier_file} | awk -F'\t' 'BEGIN{{OFS="\t"}} NR==1 {{print $0, "ancestry_notes"}} NR>1 {{print $0, "SOMALIER_PREDICTED"}}' > {output.master_tsv}
+                """, somalier_file=somalier_file)
+        else:
+            anc = manual_anc if manual_anc else "EUR"
+            note = "MANUALLY_PROVIDED_NO_PCS" if manual_anc else "DEFAULTED_SOMALIER_FAILED"
+            with open(output.master_tsv, "w") as f: 
+                f.write(f"sample_id\tpredicted_ancestry\tancestry_notes\n{BASE_SAMPLE}\t{anc}\t{note}\n")
+
+
+# QC filter the VCF and determine which chromosomes require Beagle imputation
+rule Prepare_PRS_and_Targets:
+    input:
+        vcf=f"{TMP_PATH}/leftalign_raw_full/{{sample}}_{BUILD_LOWER}_clean.vcf.gz",
+        prs_file=PRS_FILE, ref=REF_FASTA,
+        master_ancestry=f"{TMP_PATH}/ancestry_raw_full/{{sample}}_ancestry.tsv", lcr_bed=LCR_INPUT,
+        ref_calibration=f"{PANEL_CACHE_DIR}/calibration.done" 
+    output: prep_vcf=f"{TMP_PATH}/prs_prep_full/{{sample}}_prep.vcf", targets=f"{TMP_PATH}/prs_prep_full/{{sample}}_targets.txt"
+    params:
+        actions_file=VARIANT_ACTIONS if VARIANT_ACTIONS else "NONE", af_cache=AF_CACHE_FILE, af_mode=AF_MODE, audit=f"{PANEL_CACHE_DIR}/panel_harmonisation_audit.tsv",
+        assume_forward=ASSUME_FORWARD, effect_is_alt=EFFECT_IS_ALT, skip_beagle=SKIP_BEAGLE,
+        lcr_param=LCR_PARAM, input_is_gvcf="true" if INPUT_IS_GVCF else "false"
+    conda: "envs/python.yaml"
+    shell: 
+        """
+        mkdir -p {TMP_PATH}/prs_prep_full
+        python {PATH_BASE}/scripts/prep_vcf.py --build {BUILD_LOWER} \
+            --vcf {input.vcf} --prs {input.prs_file} --somalier {input.master_ancestry} \
+            --lcr {params.lcr_param} --af_cache_file {params.af_cache} --af_mode {params.af_mode} \
+            --audit_file {params.audit} \
+            --sample {BASE_SAMPLE} --out_vcf {output.prep_vcf} --out_chroms {output.targets} \
+            --min_depth {MIN_DP} --min_gq {MIN_GQ} --min_af {MIN_AF} \
+            --variant_actions {params.actions_file} --assume_forward {params.assume_forward} \
+            --effect_is_alt {params.effect_is_alt} --skip_beagle {params.skip_beagle} \
+            --pal_low {PAL_LOW} --pal_high {PAL_HIGH} \
+            --ref_fasta {input.ref} --input_is_gvcf {params.input_is_gvcf}
+        """
+
+# Impute missing variants across targeted chromosomes using Beagle
+rule BeagleImputation_Targeted:
+    input:
+        vcf=f"{TMP_PATH}/leftalign_raw_full/{{sample}}_{BUILD_LOWER}_clean.vcf.gz",
+        targets=f"{TMP_PATH}/prs_prep_full/{{sample}}_targets.txt"
+    output:
+        imputed_vcf=f"{TMP_PATH}/beagle_full/{{sample}}_imputed.vcf.gz",
+        tbi=f"{TMP_PATH}/beagle_full/{{sample}}_imputed.vcf.gz.tbi"
+    params:
+        ref_dir=BEAGLE_REF_DIR,
+        build=BUILD_LOWER,
+        tmp_dir=f"{TMP_PATH}/beagle_full/tmp_{{sample}}",
+        wgs_cache=f"{TMP_PATH}/beagle_wgs_cache/{WGS_CACHE_KEY}_{BUILD_LOWER}"
+    conda: "envs/bcftools.yaml"
+    threads: 8
+    shell:
+        r"""
+        set -euo pipefail
+        rm -rf "{params.tmp_dir}"
+        mkdir -p "{params.tmp_dir}" "$(dirname '{output.imputed_vcf}')"
+
+        link_or_copy() {{
+            ln -f "$1" "$2" 2>/dev/null || cp -f "$1" "$2"
+        }}
+
+        chroms=$(cat "{input.targets}")
+        if [ -z "$chroms" ]; then
+            echo "No imputation targets identified. Creating empty VCF."
+            printf '##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n' > "{params.tmp_dir}/empty.vcf"
+            bgzip -c "{params.tmp_dir}/empty.vcf" > "{output.imputed_vcf}"
+            tabix -p vcf "{output.imputed_vcf}"
+            rm -rf "{params.tmp_dir}"
+            exit 0
+        fi
+
+        # Limit memory and disable perf files to prevent shared-memory crashes
+        export _JAVA_OPTIONS="-Xmx16g -XX:-UsePerfData"
+        bcftools view -m2 -M2 -v snps,indels "{input.vcf}" -O z -o "{params.tmp_dir}/prep.vcf.gz"
+        bcftools index -t "{params.tmp_dir}/prep.vcf.gz"
+
+        input_sig=$(sha256sum "{input.vcf}" | awk '{{print $1}}')
+        cache_dir="{params.wgs_cache}"
+
+        if [ "{SEQ_TYPE}" = "Whole Genome Sequencing (WGS)" ]; then
+            mkdir -p "$cache_dir"
+        fi
+
+        for chr in $chroms; do
+            ref_panel="{params.ref_dir}/${{chr}}.{params.build}.bref3"
+            if [ ! -s "$ref_panel" ]; then
+                echo "WARNING: Missing Beagle reference panel: $ref_panel"
+                continue
+            fi
+
+            ref_sig=$(stat -c '%s:%y:%n' "$ref_panel")
+            cache_sig="beagle-cache-v4|input=${{input_sig}}|ref=${{ref_sig}}|build={params.build}|key={WGS_CACHE_KEY}|chrom=${{chr}}"
+            cache_vcf="$cache_dir/${{chr}}.vcf.gz"
+            cache_tbi="$cache_dir/${{chr}}.vcf.gz.tbi"
+            cache_manifest="$cache_dir/${{chr}}.manifest"
+            out_vcf="{params.tmp_dir}/${{chr}}.vcf.gz"
+
+            if [ "{SEQ_TYPE}" = "Whole Genome Sequencing (WGS)" ] \
+               && [ -s "$cache_vcf" ] \
+               && [ -s "$cache_tbi" ] \
+               && [ -s "$cache_manifest" ] \
+               && [ "$(cat "$cache_manifest")" = "$cache_sig" ]; then
+                echo "Reusing validated shared WGS Beagle cache for {WGS_CACHE_KEY} build={params.build} ${{chr}}"
+                link_or_copy "$cache_vcf" "$out_vcf"
+                link_or_copy "$cache_tbi" "$out_vcf.tbi"
+                continue
+            fi
+
+            echo "Running Beagle for {wildcards.sample} ${{chr}}"
+            rm -f "$out_vcf" "$out_vcf.tbi"
+
+            # Capture Beagle logs so real file-write errors trigger job failure
+            beagle_log="{params.tmp_dir}/${{chr}}.beagle.log"
+            beagle_ok=true
+            beagle gt="{params.tmp_dir}/prep.vcf.gz" ref="$ref_panel" chrom="$chr" out="{params.tmp_dir}/${{chr}}" > "$beagle_log" 2>&1 || beagle_ok=false
+            cat "$beagle_log"
+            if grep -qE "No space left on device|Error writing to file" "$beagle_log"; then
+                echo "ERROR: Beagle hit a filesystem write error for ${{chr}}; aborting instead of using the AF fallback." >&2
+                exit 1
+            fi
+
+            if [ "$beagle_ok" = true ]; then
+                test -s "$out_vcf"
+                tabix -p vcf "$out_vcf"
+                if [ "{SEQ_TYPE}" = "Whole Genome Sequencing (WGS)" ]; then
+                    link_or_copy "$out_vcf" "$cache_vcf"
+                    link_or_copy "$out_vcf.tbi" "$cache_tbi"
+                    printf '%s\n' "$cache_sig" > "$cache_manifest.tmp"
+                    mv -f "$cache_manifest.tmp" "$cache_manifest"
+                fi
+            else
+                echo "WARNING: Beagle failed for ${{chr}}; this chromosome will use AF fallback."
+                rm -f "$out_vcf" "$out_vcf.tbi"
+                if [ "{SEQ_TYPE}" = "Whole Genome Sequencing (WGS)" ]; then
+                    rm -f "$cache_vcf" "$cache_tbi" "$cache_manifest"
+                fi
+            fi
+        done
+
+        # Consolidate imputed chromosomes into a single output file
+        beagle_vcfs=()
+        for chr in $chroms; do
+            candidate="{params.tmp_dir}/${{chr}}.vcf.gz"
+            if [ -s "$candidate" ]; then
+                beagle_vcfs+=("$candidate")
+            fi
+        done
+        if [ ${{#beagle_vcfs[@]}} -eq 0 ]; then
+            printf '##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n' > "{params.tmp_dir}/empty.vcf"
+            bgzip -c "{params.tmp_dir}/empty.vcf" > "{output.imputed_vcf}"
+        else
+            bcftools concat --allow-overlaps "${{beagle_vcfs[@]}}" -O z -o "{output.imputed_vcf}"
+        fi
+        tabix -p vcf "{output.imputed_vcf}"
+        rm -rf "{params.tmp_dir}"
+        """
+
+# Merge original variants with newly imputed variants
+rule Merge_Beagle:
+    input: prep_vcf=f"{TMP_PATH}/prs_prep_full/{{sample}}_prep.vcf", beagle_vcf=f"{TMP_PATH}/beagle_full/{{sample}}_imputed.vcf.gz"
+    output: merged_vcf=f"{TMP_PATH}/prs_imputed_full/{{sample}}_merged.vcf"
+    conda: "envs/python.yaml"
+    shell: "mkdir -p {TMP_PATH}/prs_imputed_full && python {PATH_BASE}/scripts/merge_post_beagle.py {input.prep_vcf} {input.beagle_vcf} {output.merged_vcf} {BEAGLE_DR2}"
+
+# Calculate the final Polygenic Risk Score (PRS)
+rule Score_PRS_Imputed:
+    input:
+        vcf=f"{TMP_PATH}/prs_imputed_full/{{sample}}_merged.vcf", prs_file=PRS_FILE,
+        master_ancestry=f"{TMP_PATH}/ancestry_raw_full/{{sample}}_ancestry.tsv",
+        lcr_bed=LCR_INPUT, ref_calibration=f"{PANEL_CACHE_DIR}/calibration.done" 
+    output: results_csv=f"{TMP_PATH}/prs_imputed_full/{{sample}}_prs_results.csv"
+    params:
+        actions_file=VARIANT_ACTIONS, af_cache=AF_CACHE_FILE, af_mode=AF_MODE, audit=f"{PANEL_CACHE_DIR}/panel_harmonisation_audit.tsv",
+        stats_json=f"{PANEL_CACHE_DIR}/ancestry_stats.json",
+        ref_cache_dir=PANEL_CACHE_DIR, seq_type=SEQ_TYPE,
+        somalier_raw=SOMALIER_TARGET_FILE,
+        lcr_param=LCR_PARAM, known_anc=KNOWN_ANCESTRY
+    conda: "envs/python.yaml"
+    shell: 
+        """
+        if [ "{params.af_mode}" = "CUSTOM" ]; then USE_JSON="NONE"; else USE_JSON="{params.stats_json}"; fi
+        
+        SOMALIER_PASS="{params.somalier_raw}"
+        if [ ! -s "$SOMALIER_PASS" ] || [ "$SOMALIER_PASS" = "NONE" ]; then
+            SOMALIER_PASS="NONE"
+        fi
+
+        python {PATH_BASE}/scripts/compute_prs_zscore.py --build {BUILD_LOWER} \
+            --vcf {input.vcf} --prs {input.prs_file} --somalier {input.master_ancestry} \
+            --lcr {params.lcr_param} --af_cache_file {params.af_cache} --af_mode {params.af_mode} \
+            --audit_file {params.audit} \
+            --sample {BASE_SAMPLE} --out {output.results_csv} \
+            --variant_actions {params.actions_file} --ref_stats_json $USE_JSON \
+            --seq_type "{params.seq_type}" --ref_cache_dir "{params.ref_cache_dir}" \
+            --somalier_raw "$SOMALIER_PASS"
+        """

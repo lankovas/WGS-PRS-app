@@ -1,0 +1,15 @@
+name: python
+channels:
+ - bioconda
+ - conda-forge
+dependencies:
+ - pandas=2.3.3
+ - pysam=0.23.3
+ - python=3.13.9
+ - pyliftover
+ - openpyxl
+ - htslib
+ - scipy
+ - bcftools
+ - requests
+ 

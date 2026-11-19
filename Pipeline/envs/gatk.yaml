@@ -1,0 +1,10 @@
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - gatk4
+  - r-base
+  - r-ggplot2
+  - r-gplots
+  - r-gsalib
