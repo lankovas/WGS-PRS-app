@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/prs-app  # Maps your entire local repo to /prs-app inside the container
+      - snakemake_envs:/prs-app/.snakemake # Caches Snakemake's sub-environments
+
+volumes:
+  snakemake_envs:
